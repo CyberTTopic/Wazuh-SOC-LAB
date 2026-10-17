@@ -1,0 +1,928 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Laboratorio SOC con Wazuh y Elastic Stack</title>
+  <meta name="description" content="Laboratorio SOC con pfSense, Active Directory, Wazuh, Elastic Stack y Kali Linux.">
+  <style>
+:root { color-scheme: light; }
+* { box-sizing: border-box; }
+body { margin: 0; background: #f8fafc; font-family: 'Segoe UI', Helvetica, Arial, sans-serif; font-size: 16px; line-height: 1.6; color: #1f2937; }
+main { max-width: 980px; margin: 0 auto; padding: 32px 24px 64px; background: #ffffff; min-height: 100vh; }
+h1 { font-size: 2rem; color: #0f172a; border-bottom: 3px solid #15803d; padding-bottom: 8px; margin-top: 0; }
+h2 { font-size: 1.45rem; color: #0f172a; border-bottom: 1px solid #cbd5e1; padding-bottom: 6px; margin-top: 2.2rem; }
+h3 { font-size: 1.12rem; color: #1e3a8a; margin-top: 1.6rem; }
+p { margin: 0.6rem 0; }
+a { color: #1d4ed8; }
+code { font-family: Consolas, 'DejaVu Sans Mono', monospace; font-size: 0.88em; background: #f1f5f9; padding: 1px 5px; border-radius: 4px; }
+pre { background: #0f172a; color: #e2e8f0; padding: 14px 16px; border-radius: 8px; overflow-x: auto; font-size: 0.86rem; line-height: 1.45; }
+pre code { background: none; color: inherit; padding: 0; font-size: inherit; }
+table { border-collapse: collapse; width: 100%; margin: 0.8rem 0 1.2rem; font-size: 0.9rem; display: block; overflow-x: auto; }
+th { background: #0f766e; color: #ffffff; text-align: left; padding: 7px 9px; white-space: nowrap; }
+td { border: 1px solid #cbd5e1; padding: 6px 9px; vertical-align: top; }
+tr:nth-child(even) td { background: #f8fafc; }
+img { max-width: 100%; height: auto; display: block; margin: 1rem auto; border: 1px solid #e2e8f0; border-radius: 8px; background: #ffffff; }
+hr { border: 0; border-top: 1px solid #e2e8f0; margin: 2rem 0; }
+strong { color: #0f172a; }
+blockquote { border-left: 4px solid #15803d; margin: 1rem 0; padding: 0.4rem 1rem; background: #f0fdf4; }
+ol, ul { padding-left: 1.4rem; }
+@media (max-width: 640px) { body { font-size: 15px; } main { padding: 20px 14px 40px; } h1 { font-size: 1.6rem; } }
+@media print { body { background: #ffffff; } main { padding: 0; } pre { white-space: pre-wrap; } }
+</style>
+</head>
+<body>
+  <main>
+<h1 id="laboratorio-soc-con-wazuh-elastic-stack-pfsense-active-directory-y-kali-linux">Laboratorio SOC con Wazuh, Elastic Stack, pfSense, Active Directory y Kali Linux</h1>
+<p>Este documento describe cómo levantar un laboratorio de centro de operaciones de seguridad (SOC) con virtualización en Proxmox. Incluye la topología, la configuración de cada equipo, las integraciones entre herramientas, las reglas de detección y el plan de pruebas desde Kali Linux.</p>
+<p>Las contraseñas aparecen como marcadores (<code>CONTRASEÑA_ELASTIC</code>, <code>CONTRASEÑA_ADMIN</code>, etc.). Guárdalas en un gestor de contraseñas y nunca en el chat ni en capturas.</p>
+<hr />
+<h2 id="1-objetivo">1. Objetivo</h2>
+<p>Construir un entorno que simule una empresa con su red corporativa, un atacante externo y un centro de monitoreo, de forma que:</p>
+<ul>
+<li>Los eventos de los equipos Windows (inicios de sesión, cambios en el dominio) lleguen a Wazuh.</li>
+<li>Los bloqueos y permisos del firewall pfSense queden registrados y consultables.</li>
+<li>Las alertas se vean en dos plataformas: el dashboard de Wazuh y Kibana (Elastic Stack).</li>
+<li>El equipo de pruebas Kali Linux pueda generar actividad que el SOC detecte.</li>
+</ul>
+<hr />
+<h2 id="2-arquitectura">2. Arquitectura</h2>
+<p><img alt="Topología del laboratorio" src="diagramas/topologia.png" /></p>
+<p><strong>Flujos clave</strong></p>
+<ul>
+<li>Los agentes de Windows envían eventos al manager Wazuh por TCP 1514 (datos) y 1515 (registro).</li>
+<li>pfSense envía sus registros de firewall por syslog UDP 514 al manager Wazuh.</li>
+<li>Wazuh guarda las alertas y los archivos completos. Logstash los envía a Elastic (ELK01).</li>
+<li>El indexer de Wazuh recibe las alertas con su propio Filebeat, que instala el asistente.</li>
+<li>Kali solo llega a la red corporativa. No tiene acceso a la red SOC.</li>
+</ul>
+<p><strong>Flujo de datos</strong></p>
+<p><img alt="Flujo de datos del SOC" src="diagramas/flujo_datos.png" /></p>
+<hr />
+<h2 id="3-plan-de-direccionamiento">3. Plan de direccionamiento</h2>
+<table>
+<thead>
+<tr>
+<th>Interfaz pfSense</th>
+<th>Bridge</th>
+<th>Red</th>
+<th>IP del firewall</th>
+<th>Equipos</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>vtnet0 (WAN)</td>
+<td>vmbr0</td>
+<td>Router real</td>
+<td>DHCP</td>
+<td>Ninguno</td>
+</tr>
+<tr>
+<td>vtnet1 (LAN)</td>
+<td>vmbr1</td>
+<td>Corporate 192.168.10.0/24</td>
+<td>192.168.10.1</td>
+<td>DC01, WIN01</td>
+</tr>
+<tr>
+<td>vtnet2 (OPT1)</td>
+<td>vmbr2</td>
+<td>Red Team 192.168.30.0/24</td>
+<td>192.168.30.1</td>
+<td>Sin equipos</td>
+</tr>
+<tr>
+<td>vtnet3 (OPT2)</td>
+<td>vmbr3</td>
+<td>SOC 192.168.20.0/24</td>
+<td>192.168.20.1</td>
+<td>WAZUH01, ELK01, ANALYST01</td>
+</tr>
+<tr>
+<td>vtnet4 (OPT3)</td>
+<td>vmbr4</td>
+<td>Externa 192.168.40.0/24</td>
+<td>192.168.40.1</td>
+<td>RT01</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>VMID</th>
+<th>Nombre</th>
+<th>Función</th>
+<th>Red</th>
+<th>IP</th>
+<th>DNS</th>
+<th>vCPU</th>
+<th>RAM</th>
+<th>Disco</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>100</td>
+<td>FW01</td>
+<td>pfSense CE</td>
+<td>Todas</td>
+<td>Según interfaz</td>
+<td>-</td>
+<td>2</td>
+<td>8 GB</td>
+<td>20 GB</td>
+</tr>
+<tr>
+<td>101</td>
+<td>DC01</td>
+<td>AD DS, DNS, NTP</td>
+<td>vmbr1</td>
+<td>192.168.10.10</td>
+<td>127.0.0.1</td>
+<td>4</td>
+<td>32 GB</td>
+<td>80 GB</td>
+</tr>
+<tr>
+<td>103</td>
+<td>WIN01</td>
+<td>Windows 10 Pro</td>
+<td>vmbr1</td>
+<td>192.168.10.20</td>
+<td>192.168.10.10</td>
+<td>2</td>
+<td>16 GB</td>
+<td>50 GB</td>
+</tr>
+<tr>
+<td>105</td>
+<td>RT01</td>
+<td>Kali Linux</td>
+<td>vmbr4</td>
+<td>192.168.40.10</td>
+<td>1.1.1.1</td>
+<td>4</td>
+<td>16 GB</td>
+<td>60 GB</td>
+</tr>
+<tr>
+<td>106</td>
+<td>WAZUH01</td>
+<td>Wazuh Server</td>
+<td>vmbr3</td>
+<td>192.168.20.10</td>
+<td>192.168.20.1</td>
+<td>4</td>
+<td>32 GB</td>
+<td>100 GB</td>
+</tr>
+<tr>
+<td>107</td>
+<td>ELK01</td>
+<td>Elasticsearch, Kibana</td>
+<td>vmbr3</td>
+<td>192.168.20.11</td>
+<td>192.168.20.1</td>
+<td>6</td>
+<td>32 GB</td>
+<td>150 GB</td>
+</tr>
+<tr>
+<td>108</td>
+<td>ANALYST01</td>
+<td>Windows 10 Pro</td>
+<td>vmbr3</td>
+<td>192.168.20.20</td>
+<td>192.168.10.10</td>
+<td>2</td>
+<td>8 GB</td>
+<td>40 GB</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Dominio:</strong> <code>lab.local</code> (NetBIOS <code>LAB</code>).</p>
+<p><strong>Recursos del host:</strong> 256 GB de RAM. Las VMs suman unos 152 GB, así que queda margen. Desactiva el ballooning en las VMs de Wazuh, Elastic y Windows.</p>
+<hr />
+<h2 id="4-preparacion-en-proxmox">4. Preparación en Proxmox</h2>
+<ol>
+<li>Crea los bridges <code>vmbr0</code> a <code>vmbr4</code> en el nodo antes de las VMs.</li>
+<li>Asigna a pfSense cinco interfaces de red, una a cada bridge, en el orden <code>vtnet0</code> a <code>vtnet4</code>.</li>
+<li>Para cada VM, en <strong>Hardware &gt; Memory</strong>, desactiva el ballooning.</li>
+<li>Instala cada sistema con su IP estática. Expande el volumen LVM si el instalador deja espacio libre:</li>
+</ol>
+<pre><code class="language-bash">sudo lvextend -l +100%FREE /dev/ubuntu-vg/ubuntu-lv
+sudo resize2fs /dev/ubuntu-vg/ubuntu-lv
+df -h /
+</code></pre>
+<ol start="5">
+<li>Toma una snapshot de cada VM cuando esté funcionando, para tener puntos de restauración.</li>
+</ol>
+<hr />
+<h2 id="5-pfsense-fw01">5. pfSense (FW01)</h2>
+<h3 id="51-asignar-interfaces-y-direcciones">5.1 Asignar interfaces y direcciones</h3>
+<p>En <strong>Interfaces &gt; Assignments</strong> asigna <code>vtnet1</code> a LAN, <code>vtnet2</code> a OPT1, <code>vtnet3</code> a OPT2 (SOC) y <code>vtnet4</code> a OPT3. Para cada interfaz OPT, en <strong>Interfaces &gt; [nombre]</strong>, activa la interfaz, configura IPv4 estático y pon la IP con máscara /24 indicada en la tabla.</p>
+<h3 id="52-acceso-al-panel-web">5.2 Acceso al panel web</h3>
+<p>En <strong>System &gt; Advanced &gt; Admin Access</strong>, incluye SOC (OPT2) en las interfaces de escucha de la WebGUI si quieres administrar pfSense desde la red SOC.</p>
+<p>En <strong>Interfaces &gt; WAN &gt; Reserved Networks</strong>, desmarca <strong>Block private networks</strong> y <strong>Block bogon networks</strong>, porque la WAN recibe una dirección privada de tu router.</p>
+<h3 id="53-dns-resolver-unbound">5.3 DNS Resolver (Unbound)</h3>
+<p>En <strong>Services &gt; DNS Resolver</strong>, activa el resolver y, en <strong>Network Interfaces</strong>, incluye <strong>SOC (OPT2)</strong> o <strong>All</strong>. Así WAZUH01 y ELK01 resuelven nombres a través de 192.168.20.1.</p>
+<h3 id="54-envio-de-syslog-a-wazuh">5.4 Envío de syslog a Wazuh</h3>
+<p>En <strong>Status &gt; System Logs &gt; Settings</strong>, en <strong>Remote Logging Options</strong>:</p>
+<table>
+<thead>
+<tr>
+<th>Campo</th>
+<th>Valor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Enable Remote Logging</td>
+<td>Activado</td>
+</tr>
+<tr>
+<td>Remote log servers</td>
+<td>192.168.20.10:514</td>
+</tr>
+<tr>
+<td>Remote Syslog Contents</td>
+<td>Firewall Events</td>
+</tr>
+<tr>
+<td>Transport</td>
+<td>UDP</td>
+</tr>
+</tbody>
+</table>
+<h3 id="55-zona-horaria-y-ntp-opcional">5.5 Zona horaria y NTP (opcional)</h3>
+<p>En <strong>System &gt; General Setup</strong>, define la zona horaria del laboratorio. En <strong>Services &gt; NTP</strong>, puedes activar la interfaz LAN para que pfSense sirva hora a la red corporativa.</p>
+<h3 id="56-reglas-de-firewall">5.6 Reglas de firewall</h3>
+<p>Todas las reglas son <strong>Pass</strong>. Lo que no está permitido queda bloqueado por defecto. En OPT2, el destino del firewall es <strong>OPT2 address</strong> (192.168.20.1), no <strong>This Firewall</strong>.</p>
+<p><strong>LAN (Corporate)</strong></p>
+<table>
+<thead>
+<tr>
+<th>Código</th>
+<th>Proto</th>
+<th>Origen</th>
+<th>Destino</th>
+<th>Puerto</th>
+<th>Motivo</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>LAN-01</td>
+<td>TCP</td>
+<td>192.168.10.0/24</td>
+<td>192.168.20.10</td>
+<td>1514-1515</td>
+<td>Registro y datos de agentes Wazuh</td>
+</tr>
+<tr>
+<td>LAN-02</td>
+<td>UDP</td>
+<td>192.168.10.0/24</td>
+<td>192.168.20.10</td>
+<td>1514</td>
+<td>Eventos de agentes por UDP</td>
+</tr>
+<tr>
+<td>LAN-04</td>
+<td>Cualquiera</td>
+<td>LAN net</td>
+<td>Cualquiera</td>
+<td>Cualquiera</td>
+<td>Salida a Internet y acceso general</td>
+</tr>
+</tbody>
+</table>
+<p><strong>OPT2 (SOC)</strong></p>
+<table>
+<thead>
+<tr>
+<th>Código</th>
+<th>Proto</th>
+<th>Origen</th>
+<th>Destino</th>
+<th>Puerto</th>
+<th>Motivo</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SOC-01</td>
+<td>ICMP</td>
+<td>192.168.20.0/24</td>
+<td>OPT2 address</td>
+<td>-</td>
+<td>Diagnóstico</td>
+</tr>
+<tr>
+<td>SOC-02</td>
+<td>TCP</td>
+<td>192.168.20.0/24</td>
+<td>OPT2 address</td>
+<td>443</td>
+<td>Panel de pfSense</td>
+</tr>
+<tr>
+<td>SOC-03</td>
+<td>TCP</td>
+<td>192.168.20.0/24</td>
+<td>OPT2 address</td>
+<td>53</td>
+<td>DNS (Unbound)</td>
+</tr>
+<tr>
+<td>SOC-04</td>
+<td>UDP</td>
+<td>192.168.20.0/24</td>
+<td>OPT2 address</td>
+<td>53</td>
+<td>DNS (Unbound)</td>
+</tr>
+<tr>
+<td>SOC-05</td>
+<td>TCP</td>
+<td>192.168.20.0/24</td>
+<td>Cualquiera</td>
+<td>80, 443</td>
+<td>Descargas de paquetes</td>
+</tr>
+<tr>
+<td>SOC-06</td>
+<td>TCP</td>
+<td>192.168.20.20</td>
+<td>192.168.10.10</td>
+<td>53</td>
+<td>DNS de ANALYST01 hacia DC01</td>
+</tr>
+<tr>
+<td>SOC-07</td>
+<td>UDP</td>
+<td>192.168.20.20</td>
+<td>192.168.10.10</td>
+<td>53</td>
+<td>DNS por UDP</td>
+</tr>
+<tr>
+<td>SOC-08</td>
+<td>TCP</td>
+<td>192.168.20.20</td>
+<td>192.168.10.10</td>
+<td>88</td>
+<td>Kerberos</td>
+</tr>
+<tr>
+<td>SOC-09</td>
+<td>UDP</td>
+<td>192.168.20.20</td>
+<td>192.168.10.10</td>
+<td>88</td>
+<td>Kerberos por UDP</td>
+</tr>
+<tr>
+<td>SOC-10</td>
+<td>TCP</td>
+<td>192.168.20.20</td>
+<td>192.168.10.10</td>
+<td>389</td>
+<td>LDAP</td>
+</tr>
+<tr>
+<td>SOC-11</td>
+<td>UDP</td>
+<td>192.168.20.20</td>
+<td>192.168.10.10</td>
+<td>389</td>
+<td>LDAP por UDP</td>
+</tr>
+<tr>
+<td>SOC-12</td>
+<td>TCP</td>
+<td>192.168.20.20</td>
+<td>192.168.10.10</td>
+<td>445</td>
+<td>SMB y políticas de grupo</td>
+</tr>
+<tr>
+<td>SOC-13</td>
+<td>TCP</td>
+<td>192.168.20.20</td>
+<td>192.168.10.10</td>
+<td>135</td>
+<td>RPC endpoint mapper</td>
+</tr>
+<tr>
+<td>SOC-14</td>
+<td>TCP</td>
+<td>192.168.20.20</td>
+<td>192.168.10.10</td>
+<td>636</td>
+<td>LDAPS</td>
+</tr>
+<tr>
+<td>SOC-15</td>
+<td>TCP</td>
+<td>192.168.20.20</td>
+<td>192.168.10.10</td>
+<td>3268</td>
+<td>Catálogo global</td>
+</tr>
+<tr>
+<td>SOC-16</td>
+<td>UDP</td>
+<td>192.168.20.20</td>
+<td>192.168.10.10</td>
+<td>123</td>
+<td>NTP</td>
+</tr>
+<tr>
+<td>SOC-17</td>
+<td>TCP</td>
+<td>192.168.20.20</td>
+<td>192.168.10.10</td>
+<td>49152-65535</td>
+<td>RPC dinámico para el canal seguro y la unión al dominio</td>
+</tr>
+</tbody>
+</table>
+<p><strong>La regla SOC-17 es indispensable.</strong> Sin ella, la unión al dominio falla con el error "RPC server is unavailable", aunque los puertos 135 y 445 respondan.</p>
+<p><strong>OPT1 (Red Team):</strong> sin reglas. Queda aislada.</p>
+<p><strong>OPT3 (Kali)</strong></p>
+<table>
+<thead>
+<tr>
+<th>Código</th>
+<th>Proto</th>
+<th>Origen</th>
+<th>Destino</th>
+<th>Puerto</th>
+<th>Motivo</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>OPT3-01</td>
+<td>Cualquiera</td>
+<td>192.168.40.0/24</td>
+<td>192.168.10.0/24</td>
+<td>Cualquiera</td>
+<td>Pruebas de ataque contra Corporate</td>
+</tr>
+<tr>
+<td>OPT3-02</td>
+<td>TCP</td>
+<td>192.168.40.0/24</td>
+<td>Cualquiera</td>
+<td>80</td>
+<td>Descarga de herramientas</td>
+</tr>
+<tr>
+<td>OPT3-03</td>
+<td>TCP</td>
+<td>192.168.40.0/24</td>
+<td>Cualquiera</td>
+<td>443</td>
+<td>Descarga de herramientas</td>
+</tr>
+</tbody>
+</table>
+<p>Kali no tiene reglas hacia la red SOC, así que no llega a WAZUH01 ni a ELK01.</p>
+<p>Documento completo de reglas: <code>reglas_firewall_pfsense.md</code>.</p>
+<hr />
+<h2 id="6-active-directory-dc01">6. Active Directory (DC01)</h2>
+<h3 id="61-configuracion-de-red">6.1 Configuración de red</h3>
+<pre><code class="language-powershell">New-NetIPAddress -InterfaceAlias &quot;Ethernet&quot; -IPAddress 192.168.10.10 -PrefixLength 24 -DefaultGateway 192.168.10.1
+Set-DnsClientServerAddress -InterfaceAlias &quot;Ethernet&quot; -ServerAddresses 192.168.10.10
+Rename-Computer -NewName &quot;DC01&quot; -Restart
+</code></pre>
+<h3 id="62-instalar-ad-ds-y-dns">6.2 Instalar AD DS y DNS</h3>
+<p>Tras reiniciar, como <code>Administrador</code>:</p>
+<pre><code class="language-powershell">Install-WindowsFeature AD-Domain-Services, DNS -IncludeManagementTools
+Restart-Computer
+</code></pre>
+<p>Reinicia antes de promocionar. Sin ese reinicio, la promoción falla con el mensaje de cambio de rol pendiente.</p>
+<h3 id="63-promocionar-a-controlador-de-dominio">6.3 Promocionar a controlador de dominio</h3>
+<pre><code class="language-powershell">$dsrm = Read-Host -AsSecureString &quot;Contraseña DSRM&quot;
+Install-ADDSForest -DomainName &quot;lab.local&quot; -DomainNetbiosName &quot;LAB&quot; -InstallDns -SafeModeAdministratorPassword $dsrm -Force
+</code></pre>
+<p>El equipo se reinicia solo. Tras entrar como <code>LAB\Administrator</code>:</p>
+<pre><code class="language-powershell">Set-DnsServerForwarder -IPAddress 1.1.1.1
+Get-ADDomain
+Resolve-DnsName lab.local
+</code></pre>
+<h3 id="64-hora-y-ntp">6.4 Hora y NTP</h3>
+<pre><code class="language-powershell">Set-TimeZone -Id &quot;Eastern Standard Time&quot;
+w32tm /config /manualpeerlist:&quot;0.pool.ntp.org,0x8 1.pool.ntp.org,0x8&quot; /syncfromflags:manual /reliable:yes /update
+Restart-Service w32time
+w32tm /resync /rediscover
+</code></pre>
+<p>Activa el servidor NTP para que WAZUH01, ELK01 y pfSense puedan sincronizar con DC01:</p>
+<pre><code class="language-powershell">reg add &quot;HKLM\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders\NtpServer&quot; /v Enabled /t REG_DWORD /d 1 /f
+reg add &quot;HKLM\SYSTEM\CurrentControlSet\Services\W32Time\Config&quot; /v AnnounceFlags /t REG_DWORD /d 5 /f
+Restart-Service w32time
+</code></pre>
+<p>Y el controlador debe estar sano:</p>
+<pre><code class="language-powershell">dcdiag /test:sysvolcheck /test:replications /test:dns
+</code></pre>
+<p>Las pruebas deben dar <code>passed</code>. Antes de unir equipos, toma una snapshot de DC01.</p>
+<hr />
+<h2 id="7-union-de-equipos-al-dominio-win01-y-analyst01">7. Unión de equipos al dominio (WIN01 y ANALYST01)</h2>
+<h3 id="71-requisitos">7.1 Requisitos</h3>
+<p>Cada equipo debe tener:</p>
+<ul>
+<li>IP estática en su red, con gateway de pfSense.</li>
+<li>DNS apuntando a <strong>192.168.10.10</strong> (DC01).</li>
+<li>Hora sincronizada con DC01 (diferencia menor de un minuto).</li>
+<li>Las reglas de firewall correspondientes, incluida SOC-17 en el caso de ANALYST01.</li>
+</ul>
+<h3 id="72-configuracion-de-red-de-analyst01-ejemplo">7.2 Configuración de red de ANALYST01 (ejemplo)</h3>
+<pre><code class="language-powershell">New-NetIPAddress -InterfaceAlias &quot;Ethernet&quot; -IPAddress 192.168.20.20 -PrefixLength 24 -DefaultGateway 192.168.20.1
+Set-DnsClientServerAddress -InterfaceAlias &quot;Ethernet&quot; -ServerAddresses 192.168.10.10
+Rename-Computer -NewName &quot;ANALYST01&quot; -Restart
+</code></pre>
+<h3 id="73-comprobaciones-antes-de-unir">7.3 Comprobaciones antes de unir</h3>
+<pre><code class="language-powershell">Resolve-DnsName lab.local
+Test-NetConnection 192.168.10.10 -Port 389
+Test-NetConnection 192.168.10.10 -Port 445
+w32tm /stripchart /computer:192.168.10.10 /samples:3 /dataonly
+</code></pre>
+<h3 id="74-union-al-dominio">7.4 Unión al dominio</h3>
+<pre><code class="language-powershell">Add-Computer -DomainName &quot;lab.local&quot; -Credential (Get-Credential LAB\Administrator) -Restart
+</code></pre>
+<p>Tras reiniciar, inicia sesión con <code>LAB\Administrator</code> o con un usuario de dominio, y verifica:</p>
+<pre><code class="language-powershell">(Get-CimInstance Win32_ComputerSystem).Domain
+Test-ComputerSecureChannel
+nltest /dsgetdc:lab.local
+</code></pre>
+<p>Debe mostrar <code>lab.local</code> y <code>True</code>.</p>
+<hr />
+<h2 id="8-elastic-stack-elk01">8. Elastic Stack (ELK01)</h2>
+<h3 id="81-repositorio-e-instalacion">8.1 Repositorio e instalación</h3>
+<pre><code class="language-bash">sudo apt update &amp;&amp; sudo apt install -y apt-transport-https curl gnupg
+curl -fsSL https://artifacts.elastic.co/GPG-KEY-elasticsearch | sudo gpg --dearmor -o /usr/share/keyrings/elastic.gpg
+echo &quot;deb [signed-by=/usr/share/keyrings/elastic.gpg] https://artifacts.elastic.co/packages/8.x/apt stable main&quot; | sudo tee /etc/apt/sources.list.d/elastic-8.x.list
+sudo apt update
+sudo apt install -y elasticsearch kibana
+</code></pre>
+<p>Guarda la contraseña del usuario <code>elastic</code> que muestra la instalación.</p>
+<h3 id="82-elasticsearch">8.2 Elasticsearch</h3>
+<p>Edita <code>/etc/elasticsearch/elasticsearch.yml</code> y deja activa esta línea:</p>
+<pre><code class="language-yaml">network.host: 192.168.20.11
+</code></pre>
+<pre><code class="language-bash">sudo systemctl enable --now elasticsearch
+curl -k -u elastic:CONTRASEÑA_ELASTIC &quot;https://192.168.20.11:9200/&quot;
+</code></pre>
+<h3 id="83-kibana">8.3 Kibana</h3>
+<p>Genera el token de enrolamiento y ejecuta el asistente:</p>
+<pre><code class="language-bash">sudo /usr/share/elasticsearch/bin/elasticsearch-create-enrollment-token -s kibana
+sudo /usr/share/kibana/bin/kibana-setup
+</code></pre>
+<p>Genera las claves de cifrado y añádelas a <code>/etc/kibana/kibana.yml</code>:</p>
+<pre><code class="language-bash">sudo /usr/share/kibana/bin/kibana-encryption-keys generate
+sudo nano /etc/kibana/kibana.yml
+</code></pre>
+<p>Al final del archivo, cada línea sin sangría:</p>
+<pre><code class="language-yaml">server.host: &quot;192.168.20.11&quot;
+server.port: 5601
+xpack.encryptedSavedObjects.encryptionKey: &quot;CLAVE_1&quot;
+xpack.reporting.encryptionKey: &quot;CLAVE_2&quot;
+xpack.security.encryptionKey: &quot;CLAVE_3&quot;
+</code></pre>
+<p><strong>Estas claves no deben cambiarse.</strong> Si cambian, Kibana no puede leer los objetos guardados (dashboards, reglas, conectores).</p>
+<pre><code class="language-bash">sudo systemctl enable --now kibana
+sleep 90
+sudo ss -tlnp | grep 5601
+</code></pre>
+<p>Debe aparecer <code>192.168.20.11:5601</code>. Desde ANALYST01, abre <code>http://192.168.20.11:5601</code> con un navegador actualizado, porque la versión 8.19 no carga en navegadores antiguos.</p>
+<hr />
+<h2 id="9-wazuh-server-wazuh01">9. Wazuh Server (WAZUH01)</h2>
+<h3 id="91-instalacion-asistida">9.1 Instalación asistida</h3>
+<p>Descarga el instalador de la versión 4.14 y ejecútalo:</p>
+<pre><code class="language-bash">curl -sO https://packages.wazuh.com/4.14/wazuh-install.sh
+head -n 1 wazuh-install.sh
+sudo bash ./wazuh-install.sh -a
+</code></pre>
+<p>La primera línea debe ser <code>#!/bin/bash</code>. Al final, el script muestra las credenciales de <code>admin</code>. Guárdalas.</p>
+<p>Para recuperarlas más adelante:</p>
+<pre><code class="language-bash">sudo tar -xOf wazuh-install-files.tar wazuh-install-files/wazuh-passwords.txt
+</code></pre>
+<h3 id="92-memoria-del-indexer">9.2 Memoria del indexer</h3>
+<p>Con 32 GB de RAM en la VM, limita el heap del indexer a la mitad:</p>
+<pre><code class="language-bash">sudo nano /etc/wazuh-indexer/jvm.options
+</code></pre>
+<pre><code>-Xms16g
+-Xmx16g
+</code></pre>
+<pre><code class="language-bash">sudo systemctl restart wazuh-indexer
+sleep 120
+free -h
+</code></pre>
+<p>Sin límite, el indexer ocupa toda la memoria y el sistema deja de responder.</p>
+<h3 id="93-recepcion-de-syslog-de-pfsense">9.3 Recepción de syslog de pfSense</h3>
+<p>Edita <code>/var/ossec/etc/ossec.conf</code> una sola vez:</p>
+<pre><code class="language-bash">sudo nano /var/ossec/etc/ossec.conf
+</code></pre>
+<p>Dentro de <code>&lt;global&gt;</code>, deja solo estas dos líneas, con valor <code>yes</code>:</p>
+<pre><code class="language-xml">&lt;logall&gt;yes&lt;/logall&gt;
+&lt;logall_json&gt;yes&lt;/logall_json&gt;
+</code></pre>
+<p>Dentro de <code>&lt;ossec_config&gt;</code>, fuera de <code>&lt;global&gt;</code>, añade el receptor:</p>
+<pre><code class="language-xml">&lt;remote&gt;
+  &lt;connection&gt;syslog&lt;/connection&gt;
+  &lt;port&gt;514&lt;/port&gt;
+  &lt;protocol&gt;udp&lt;/protocol&gt;
+  &lt;allowed-ips&gt;192.168.20.1&lt;/allowed-ips&gt;
+&lt;/remote&gt;
+</code></pre>
+<pre><code class="language-bash">sudo grep -n &quot;logall&quot; /var/ossec/etc/ossec.conf
+sudo systemctl restart wazuh-manager
+sudo ss -ulnp | grep 514
+</code></pre>
+<p>Los registros de pfSense quedan en <code>/var/ossec/logs/archives/archives.json</code>. El campo <code>location</code> vale <code>192.168.20.1</code>.</p>
+<hr />
+<h2 id="10-agentes-wazuh-win01-dc01-y-analyst01">10. Agentes Wazuh (WIN01, DC01 y ANALYST01)</h2>
+<p>En cada equipo Windows, como administrador, registra el agente apuntando al manager:</p>
+<pre><code class="language-powershell">Stop-Service WazuhSvc
+Remove-Item &quot;C:\Program Files (x86)\ossec-agent\client.keys&quot; -ErrorAction SilentlyContinue
+cd &quot;C:\Program Files (x86)\ossec-agent&quot;
+.\agent-auth.exe -m 192.168.20.10 -A NOMBRE_EQUIPO
+Start-Service WazuhSvc
+Get-Content &quot;C:\Program Files (x86)\ossec-agent\ossec.log&quot; -Tail 10
+</code></pre>
+<p>Sustituye <code>NOMBRE_EQUIPO</code> por <code>WIN01</code>, <code>DC01</code> o <code>ANALYST01</code>. Busca <code>Valid key received</code> o <code>Connected to the server</code> en el log.</p>
+<p>En WAZUH01 confirma el estado:</p>
+<pre><code class="language-bash">sudo /var/ossec/bin/agent_control -l
+</code></pre>
+<p>Los tres agentes deben aparecer como <code>Active</code>.</p>
+<hr />
+<h2 id="11-logstash-envio-a-elastic-wazuh01">11. Logstash: envío a Elastic (WAZUH01)</h2>
+<p>Logstash lee los archivos de Wazuh y los envía a ELK01.</p>
+<h3 id="111-instalacion-y-memoria">11.1 Instalación y memoria</h3>
+<pre><code class="language-bash">curl -fsSL https://artifacts.elastic.co/GPG-KEY-elasticsearch | sudo gpg --dearmor -o /usr/share/keyrings/elastic.gpg
+echo &quot;deb [signed-by=/usr/share/keyrings/elastic.gpg] https://artifacts.elastic.co/packages/8.x/apt stable main&quot; | sudo tee /etc/apt/sources.list.d/elastic-8.x.list
+sudo apt update
+sudo apt install -y logstash
+</code></pre>
+<p>En <code>/etc/logstash/jvm.options</code> deben estar estas líneas:</p>
+<pre><code>-Xms1g
+-Xmx1g
+</code></pre>
+<h3 id="112-certificado-de-elastic">11.2 Certificado de Elastic</h3>
+<p>Copia el contenido de <code>/etc/elasticsearch/certs/http_ca.crt</code> de ELK01 y pégalo en WAZUH01:</p>
+<pre><code class="language-bash">sudo mkdir -p /etc/logstash/certs
+sudo nano /etc/logstash/certs/elk-ca.crt
+</code></pre>
+<h3 id="113-contrasena-en-el-keystore">11.3 Contraseña en el keystore</h3>
+<p>Así la contraseña no queda en texto plano:</p>
+<pre><code class="language-bash">sudo /usr/share/logstash/bin/logstash-keystore --path.settings /etc/logstash create
+sudo /usr/share/logstash/bin/logstash-keystore --path.settings /etc/logstash add ELASTIC_PASS
+sudo chown logstash:logstash /etc/logstash/logstash.keystore
+</code></pre>
+<h3 id="114-permisos-de-lectura-sobre-los-logs-de-wazuh">11.4 Permisos de lectura sobre los logs de Wazuh</h3>
+<pre><code class="language-bash">sudo usermod -aG wazuh logstash
+sudo chmod 640 /var/ossec/logs/alerts/alerts.json /var/ossec/logs/archives/archives.json
+sudo chmod 750 /var/ossec/logs/alerts /var/ossec/logs/archives
+</code></pre>
+<h3 id="115-ruta-de-logs-del-servicio">11.5 Ruta de logs del servicio</h3>
+<p>Logstash necesita la variable de ruta de logs. Añádela a <code>/etc/default/logstash</code>:</p>
+<pre><code class="language-bash">echo 'LS_LOGS=&quot;/var/log/logstash&quot;' | sudo tee -a /etc/default/logstash
+sudo chown -R logstash:logstash /var/log/logstash /var/lib/logstash /etc/logstash
+</code></pre>
+<h3 id="116-pipeline">11.6 Pipeline</h3>
+<pre><code class="language-bash">sudo nano /etc/logstash/conf.d/wazuh.conf
+</code></pre>
+<pre><code>input {
+  file {
+    path =&gt; &quot;/var/ossec/logs/alerts/alerts.json&quot;
+    codec =&gt; &quot;json&quot;
+    start_position =&gt; &quot;end&quot;
+    sincedb_path =&gt; &quot;/var/lib/logstash/sincedb_alerts&quot;
+    tags =&gt; [&quot;alerts&quot;]
+  }
+  file {
+    path =&gt; &quot;/var/ossec/logs/archives/archives.json&quot;
+    codec =&gt; &quot;json&quot;
+    start_position =&gt; &quot;end&quot;
+    sincedb_path =&gt; &quot;/var/lib/logstash/sincedb_archives&quot;
+    tags =&gt; [&quot;archives&quot;]
+  }
+}
+
+output {
+  elasticsearch {
+    hosts =&gt; [&quot;https://192.168.20.11:9200&quot;]
+    user =&gt; &quot;elastic&quot;
+    password =&gt; &quot;${ELASTIC_PASS}&quot;
+    ssl_enabled =&gt; true
+    ssl_certificate_authorities =&gt; [&quot;/etc/logstash/certs/elk-ca.crt&quot;]
+    index =&gt; &quot;wazuh-%{[tags][0]}-4.x-%{+YYYY.MM.dd}&quot;
+  }
+}
+</code></pre>
+<p>Valida y arranca el servicio:</p>
+<pre><code class="language-bash">sudo /usr/share/logstash/bin/logstash -t --path.settings /etc/logstash -f /etc/logstash/conf.d/wazuh.conf
+sudo systemctl enable --now logstash
+sleep 60
+curl -s http://localhost:9600/_node/stats/pipelines?pretty | grep -E '&quot;status&quot;|&quot;successes&quot;'
+</code></pre>
+<p>El estado debe ser <code>green</code> y el output debe mostrar respuestas <code>200</code>.</p>
+<h3 id="117-comprobacion-en-elk01">11.7 Comprobación en ELK01</h3>
+<pre><code class="language-bash">curl -k -u elastic:CONTRASEÑA_ELASTIC &quot;https://192.168.20.11:9200/_cat/indices/wazuh-*?v&quot;
+</code></pre>
+<p>Deben aparecer <code>wazuh-alerts-4.x-AAAA.MM.DD</code> y <code>wazuh-archives-4.x-AAAA.MM.DD</code> con <code>docs.count</code> creciendo.</p>
+<hr />
+<h2 id="12-kibana-vistas-de-datos">12. Kibana: vistas de datos</h2>
+<p>Crea dos data views en <strong>Stack Management &gt; Data Views</strong>:</p>
+<table>
+<thead>
+<tr>
+<th>Nombre</th>
+<th>Patrón</th>
+<th>Campo de tiempo</th>
+<th>Para qué</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Alertas Wazuh</td>
+<td><code>wazuh-alerts-*</code></td>
+<td><code>@timestamp</code></td>
+<td>Alertas por agente, gravedad y descripción</td>
+</tr>
+<tr>
+<td>Registros Wazuh</td>
+<td><code>wazuh-archives-*</code></td>
+<td><code>@timestamp</code></td>
+<td>Tráfico de pfSense y eventos completos</td>
+</tr>
+</tbody>
+</table>
+<p>Después de crearlos, pulsa <strong>Refresh fields</strong> en cada uno.</p>
+<p>En Discover, filtra el firewall con:</p>
+<pre><code>location : &quot;192.168.20.1&quot;
+</code></pre>
+<p>Y los bloqueos con:</p>
+<pre><code>location : &quot;192.168.20.1&quot; and full_log : *block*
+</code></pre>
+<h3 id="121-dashboard-de-alertas">12.1 Dashboard de alertas</h3>
+<p>Cuatro visualizaciones en el dashboard <strong>Alertas Por Agentes</strong>:</p>
+<ol>
+<li><strong>Alertas por agente:</strong> barras verticales, eje horizontal <code>agent.name.keyword</code> (Top 10) y eje vertical Count.</li>
+<li><strong>Alertas a lo largo del tiempo:</strong> líneas, <code>@timestamp</code> como Date histogram y Count.</li>
+<li><strong>Intentos de inicio de sesión fallidos:</strong> tabla con <code>rule.groups : authentication_failed</code>, filas por <code>agent.name.keyword</code>.</li>
+<li><strong>Alertas de nivel alto:</strong> tabla con <code>rule.level &gt;= 10</code>, filas por <code>rule.description.keyword</code>.</li>
+</ol>
+<h3 id="122-dashboard-de-monitoreo-de-reglas">12.2 Dashboard de monitoreo de reglas</h3>
+<p>Clona <strong>[Elastic Security] Detection rule monitoring</strong> desde <strong>Analytics &gt; Dashboards &gt; Clone</strong>. Es un dashboard gestionado por Kibana, así que la copia es la que puedes modificar.</p>
+<hr />
+<h2 id="13-reglas-de-deteccion">13. Reglas de detección</h2>
+<p>Se crean en <strong>Security &gt; Rules &gt; Detection rules (SIEM)</strong>, con <strong>Create new rule &gt; Custom query</strong>. En el paso <strong>Source</strong>, quita los índices por defecto y deja solo el que corresponde. Programación: cada 5 minutos, look-back de 5 minutos.</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Nombre</th>
+<th>Índice</th>
+<th>Consulta</th>
+<th>Severidad</th>
+<th>Riesgo</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Intentos de inicio de sesión fallidos (Wazuh)</td>
+<td><code>wazuh-alerts-*</code></td>
+<td><code>rule.groups : authentication_failed</code></td>
+<td>Medium</td>
+<td>50</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Múltiples fallos de inicio de sesión (Wazuh)</td>
+<td><code>wazuh-alerts-*</code></td>
+<td><code>rule.groups : authentication_failures</code></td>
+<td>High</td>
+<td>70</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Alertas de nivel alto (Wazuh)</td>
+<td><code>wazuh-alerts-*</code></td>
+<td><code>rule.level &gt;= 10</code></td>
+<td>High</td>
+<td>73</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Bloqueos TCP del firewall pfSense en SOC (Wazuh)</td>
+<td><code>wazuh-archives-*</code></td>
+<td><code>location : "192.168.20.1" and full_log : *block* and full_log : *tcp* and full_log : *vtnet3*</code></td>
+<td>Low</td>
+<td>21</td>
+</tr>
+<tr>
+<td>5</td>
+<td>Actividad de seguridad en Windows (Wazuh)</td>
+<td><code>wazuh-alerts-*</code></td>
+<td><code>rule.groups : windows_security and rule.level &gt;= 5</code></td>
+<td>Medium</td>
+<td>50</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Notas de configuración</strong></p>
+<ul>
+<li>Si aparece el aviso de índice no encontrado, revisa que el patrón coincide exactamente con el nombre del índice, incluido el prefijo <code>wazuh-</code>.</li>
+<li>La regla 4 usa <strong>Max alerts per run</strong> a 999 y una consulta filtrada. Sin filtro, un firewall genera miles de alertas por ejecución.</li>
+<li><strong>Suppress alerts by</strong> requiere licencia Platinum o superior, por eso no se usa.</li>
+</ul>
+<hr />
+<h2 id="14-pruebas-de-funcionamiento">14. Pruebas de funcionamiento</h2>
+<h3 id="141-bloqueo-de-conexion-desde-la-red-soc">14.1 Bloqueo de conexión desde la red SOC</h3>
+<p>Desde ANALYST01 (192.168.20.20), intenta un puerto que no está permitido hacia DC01:</p>
+<pre><code class="language-powershell">Test-NetConnection 192.168.10.10 -Port 9998
+</code></pre>
+<p>La conexión se bloquea. pfSense registra el bloqueo en la interfaz <code>vtnet3</code>. En WAZUH01 aparece en el archivo de archivos:</p>
+<pre><code class="language-bash">sudo grep &quot;9998&quot; /var/ossec/logs/archives/archives.json | grep &quot;filterlog&quot; | tail -n 1
+</code></pre>
+<p>El evento llega a Elastic con <code>location: "192.168.20.1"</code>, y su <code>full_log</code> contiene <code>192.168.20.20,192.168.10.10,...,9998</code>.</p>
+<h3 id="142-autenticacion">14.2 Autenticación</h3>
+<p>Los inicios de sesión de los equipos del dominio llegan a <code>wazuh-alerts-*</code> con <code>agent.name</code> y la regla correspondiente. Búscalos en Discover con:</p>
+<pre><code>agent.name : &quot;DC01&quot; and rule.groups : windows_security
+</code></pre>
+<hr />
+<h2 id="15-escenarios-de-ataque-desde-kali-linux-rt01">15. Escenarios de ataque desde Kali Linux (RT01)</h2>
+<p>Esta sección es el plan de pruebas. Completa la columna de resultado con lo que observes en Wazuh y en Kibana.</p>
+<p><strong>Observado hasta ahora:</strong> Kali (192.168.40.100) envió consultas DNS al firewall por la interfaz OPT3, y pfSense las bloqueó porque la zona no tiene regla DNS. El registro aparece en <code>wazuh-archives-*</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Prueba</th>
+<th>Herramienta</th>
+<th>Objetivo</th>
+<th>Qué debe detectar el SOC</th>
+<th>Resultado</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Escaneo de puertos</td>
+<td><code>nmap -sS 192.168.10.0/24</code></td>
+<td>DC01 y WIN01</td>
+<td>Bloqueos de pfSense en OPT3 y eventos de conexión</td>
+<td>Pendiente</td>
+</tr>
+<tr>
+<td>Fuerza bruta SMB</td>
+<td><code>crackmapexec smb 192.168.10.10 -u usuarios.txt -p claves.txt</code></td>
+<td>DC01</td>
+<td>Varios <code>authentication_failures</code></td>
+<td>Pendiente</td>
+</tr>
+<tr>
+<td>Fuerza bruta RDP o WinRM</td>
+<td><code>hydra</code> o <code>evil-winrm</code></td>
+<td>WIN01</td>
+<td>Inicios de sesión fallidos en el agente</td>
+<td>Pendiente</td>
+</tr>
+<tr>
+<td>Enumeración de usuarios AD</td>
+<td><code>ldapsearch -x -H ldap://192.168.10.10</code></td>
+<td>DC01</td>
+<td>Consultas LDAP desde el exterior (si OPT3 tiene regla)</td>
+<td>Pendiente</td>
+</tr>
+</tbody>
+</table>
+<p>Para cada prueba, anota la hora UTC de inicio, el resultado y la regla que se disparó. Así podrás relacionar el ataque con la alerta en Kibana.</p>
+<hr />
+<h2 id="16-lecciones-y-buenas-practicas">16. Lecciones y buenas prácticas</h2>
+<ul>
+<li><strong>Usa IPs estáticas y DNS coherentes.</strong> Un equipo unido al dominio debe resolver <code>lab.local</code> con DC01.</li>
+<li><strong>Revisa la regla RPC dinámica</strong> (SOC-17) antes de intentar cualquier unión al dominio.</li>
+<li><strong>Mantén las claves de cifrado de Kibana.</strong> Sin ellas, los objetos guardados no se pueden leer.</li>
+<li><strong>Limita la memoria de cada servicio Java</strong> a la mitad de la RAM de su VM.</li>
+<li><strong>Usa un único destino por proceso de envío.</strong> Logstash a Elastic y el Filebeat de Wazuh al indexer, sin duplicar lectores.</li>
+<li><strong>Revisa los índices de hoy</strong> en Kibana antes de depurar el resto. Un data view con campos antiguos muestra vacío aunque los datos existan.</li>
+<li><strong>Cambia cualquier contraseña que aparezca en un chat o en una captura.</strong></li>
+<li><strong>Toma snapshots</strong> cuando cada VM esté validada.</li>
+</ul>
+<hr />
+<h2 id="17-cierre">17. Cierre</h2>
+<p>El laboratorio cubre tres capas:</p>
+<ol>
+<li><strong>Red y control de acceso:</strong> pfSense segmenta Corporate, SOC y la zona externa, y registra cada bloqueo.</li>
+<li><strong>Identidad y endpoints:</strong> DC01 gestiona el dominio, y WIN01 y ANALYST01 envían sus eventos a Wazuh.</li>
+<li><strong>Detección y análisis:</strong> Wazuh genera alertas, Logstash las envía a Elastic, y Kibana y el dashboard de Wazuh permiten investigarlas.</li>
+</ol>
+<hr />
+  </main>
+</body>
+</html>
